@@ -1,0 +1,74 @@
+# ──────────────────────────────────────────────────────────────────────────
+# Daily Kids Fun Fact Video Generator – GitHub Actions Workflow
+#
+# Runs every day at 08:00 UTC (13:30 IST).
+# Generates a 9:16 short-form video and uploads it to YouTube.
+#
+# Required GitHub Secrets:
+#   GEMINI_API_KEY          – Google AI Studio API key
+#   PEXELS_API_KEY          – Pexels API key
+#   YOUTUBE_OAUTH_TOKEN     – Contents of token.json (from local OAuth flow)
+#   YOUTUBE_CLIENT_SECRETS  – Contents of client_secrets.json
+# ──────────────────────────────────────────────────────────────────────────
+
+name: Daily Kids Fun Fact Short
+
+on:
+  schedule:
+    # Every day at 08:00 UTC
+    - cron: "0 8 * * *"
+
+  # Allow manual trigger from GitHub UI for testing
+  workflow_dispatch:
+
+jobs:
+  generate-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+
+    steps:
+      # ── 1. Checkout repository ──
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ──
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # ── 3. Install system dependencies: ffmpeg & fonts ──
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+
+      # ── 4. Install Python dependencies ──
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # ── 5. Restore YouTube OAuth credentials from secrets ──
+      - name: Write YouTube credentials
+        env:
+          YOUTUBE_OAUTH_TOKEN: ${{ secrets.YOUTUBE_OAUTH_TOKEN }}
+          YOUTUBE_CLIENT_SECRETS: ${{ secrets.YOUTUBE_CLIENT_SECRETS }}
+        run: |
+          echo "$YOUTUBE_OAUTH_TOKEN" > token.json
+          echo "$YOUTUBE_CLIENT_SECRETS" > client_secrets.json
+
+      # ── 6. Run the pipeline ──
+      - name: Generate & upload video
+        run: python main.py
+
+      # ── 7. Upload the rendered video as a build artifact (backup) ──
+      - name: Archive rendered video
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-kids-fact-video
+          path: output/final_video.mp4
+          retention-days: 7

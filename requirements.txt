@@ -1,0 +1,11 @@
+# === Core Dependencies ===
+google-genai>=1.0.0          # Google Gemini API client (free tier)
+edge-tts>=6.1.0              # Microsoft Edge TTS – free, no API key
+moviepy>=1.0.3               # Video editing & compositing
+requests>=2.31.0             # HTTP client for Pexels API
+python-dotenv>=1.0.0         # Load .env config locally
+
+# === YouTube Upload ===
+google-api-python-client>=2.100.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.2.0
