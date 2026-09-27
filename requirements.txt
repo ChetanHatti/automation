@@ -1,7 +1,8 @@
 # === Core Dependencies ===
 google-genai>=1.0.0          # Google Gemini API client (free tier)
 edge-tts>=6.1.0              # Microsoft Edge TTS – free, no API key
-moviepy>=1.0.3               # Video editing & compositing
+moviepy>=2.0.0               # Video editing & compositing (v2 API)
+Pillow>=10.0.0               # Required by moviepy TextClip (image rendering)
 requests>=2.31.0             # HTTP client for Pexels API
 python-dotenv>=1.0.0         # Load .env config locally
 

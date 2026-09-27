@@ -15,16 +15,26 @@ name: Daily Kids Fun Fact Short
 
 on:
   schedule:
-    # Every day at 08:00 UTC
+    # Every day at 08:00 UTC (13:30 IST)
     - cron: "0 8 * * *"
 
   # Allow manual trigger from GitHub UI for testing
   workflow_dispatch:
 
+  # Push trigger keeps the repo "active" so GitHub doesn't disable
+  # the scheduled cron for inactivity (repos idle >60 days get disabled)
+  push:
+    branches:
+      - main
+
+# Needed to write back a refreshed token.json if OAuth token auto-refreshes
+permissions:
+  contents: write
+
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -36,16 +46,21 @@ jobs:
         uses: actions/checkout@v4
 
       # ── 2. Set up Python ──
-      - name: Set up Python 3.10
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+          cache: "pip"
 
-      # ── 3. Install system dependencies: ffmpeg & fonts ──
+      # ── 3. Install system dependencies: ffmpeg, fonts & ImageMagick ──
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          sudo apt-get install -y -qq \
+            ffmpeg \
+            fonts-dejavu-core \
+            fonts-liberation \
+            imagemagick
 
       # ── 4. Install Python dependencies ──
       - name: Install Python dependencies
@@ -59,16 +74,40 @@ jobs:
         run: |
           echo "$YOUTUBE_OAUTH_TOKEN" > token.json
           echo "$YOUTUBE_CLIENT_SECRETS" > client_secrets.json
+          echo "Credentials written successfully."
 
-      # ── 6. Run the pipeline ──
+      # ── 6. Validate secrets are present ──
+      - name: Validate required secrets
+        run: |
+          python - <<'EOF'
+          import os, sys
+          missing = []
+          for var in ["GEMINI_API_KEY", "PEXELS_API_KEY"]:
+              if not os.environ.get(var):
+                  missing.append(var)
+          if not os.path.exists("token.json") or os.path.getsize("token.json") < 10:
+              missing.append("YOUTUBE_OAUTH_TOKEN (token.json is empty)")
+          if not os.path.exists("client_secrets.json") or os.path.getsize("client_secrets.json") < 10:
+              missing.append("YOUTUBE_CLIENT_SECRETS (client_secrets.json is empty)")
+          if missing:
+              print("ERROR: Missing secrets:", missing)
+              sys.exit(1)
+          print("All required secrets are present.")
+          EOF
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+
+      # ── 7. Run the pipeline ──
       - name: Generate & upload video
         run: python main.py
 
-      # ── 7. Upload the rendered video as a build artifact (backup) ──
+      # ── 8. Upload the rendered video as a build artifact (backup) ──
       - name: Archive rendered video
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: daily-kids-fact-video
           path: output/final_video.mp4
+          if-no-files-found: warn
           retention-days: 7
