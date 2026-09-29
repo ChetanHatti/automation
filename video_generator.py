@@ -96,25 +96,55 @@ def generate_tech_fact() -> str:
         "- Output ONLY the fact text, nothing else."
     )
 
-    # Retry with backoff for transient errors (free tier rate limits / overload)
-    max_retries = 5
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-            )
-            break
-        except Exception as e:
-            if attempt < max_retries:
-                wait = attempt * 15
-                logger.warning(
-                    "Gemini error (attempt %d/%d): %s - retrying in %ds ...",
-                    attempt, max_retries, type(e).__name__, wait,
+    # Model fallback chain – ordered newest → oldest.
+    # If Google deprecates the top model (404 error), the next one is tried
+    # automatically. No manual code change ever needed.
+    GEMINI_MODELS = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-8b",  # lightest free-tier fallback
+    ]
+
+    response = None
+    last_error = None
+
+    for model_name in GEMINI_MODELS:
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info("Trying Gemini model: %s (attempt %d/%d)", model_name, attempt, max_retries)
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
                 )
-                time.sleep(wait)
-            else:
-                raise
+                logger.info("Success with model: %s", model_name)
+                break  # inner loop
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                # 404 = model gone/deprecated → skip to next model immediately
+                if "404" in err_str or "NOT_FOUND" in err_str or "no longer available" in err_str.lower():
+                    logger.warning("Model '%s' is unavailable (deprecated/removed). Trying next model ...", model_name)
+                    break  # exit retry loop, try next model
+                # Other error (rate limit, overload) → retry with backoff
+                if attempt < max_retries:
+                    wait = attempt * 15
+                    logger.warning(
+                        "Gemini error on '%s' (attempt %d/%d): %s – retrying in %ds ...",
+                        model_name, attempt, max_retries, type(e).__name__, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.warning("All retries exhausted for model '%s'. Trying next model ...", model_name)
+        if response is not None:
+            break  # outer loop – we have a response
+
+    if response is None:
+        raise RuntimeError(
+            f"All Gemini models failed. Last error: {last_error}\n"
+            "Check https://ai.google.dev/gemini-api/docs/models for currently available models."
+        )
 
     fact = response.text.strip()
 
