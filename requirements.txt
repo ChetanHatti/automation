@@ -1,5 +1,5 @@
 # === Core Dependencies ===
-google-genai>=1.0.0          # Google Gemini API client (free tier)
+google-generativeai>=0.8.0   # Google Gemini API client (stable SDK)
 edge-tts>=6.1.0              # Microsoft Edge TTS – free, no API key
 moviepy>=2.0.0               # Video editing & compositing (v2 API)
 Pillow>=10.0.0               # Required by moviepy TextClip (image rendering)

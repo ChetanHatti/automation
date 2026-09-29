@@ -18,7 +18,7 @@ import random
 import time
 
 import requests
-from google import genai
+import google.generativeai as genai
 from moviepy import (
     VideoFileClip,
     AudioFileClip,
@@ -80,7 +80,7 @@ def generate_tech_fact() -> str:
     if not api_key:
         raise EnvironmentError("GEMINI_API_KEY is not set.")
 
-    client = genai.Client(api_key=api_key)
+    genai.configure(api_key=api_key)
 
     prompt = (
         "You are a fun educational content writer for children aged 5 to 12. "
@@ -96,14 +96,13 @@ def generate_tech_fact() -> str:
         "- Output ONLY the fact text, nothing else."
     )
 
-    # Model fallback chain – ordered newest → oldest.
-    # If Google deprecates the top model (404 error), the next one is tried
-    # automatically. No manual code change ever needed.
+    # Model fallback chain – ordered newest → oldest (stable SDK names).
+    # If Google deprecates the top model, the next one is tried automatically.
     GEMINI_MODELS = [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-8b",  # lightest free-tier fallback
+        "gemini-1.5-flash",        # fast, free, always available
+        "gemini-1.5-flash-8b",     # lighter free-tier variant
+        "gemini-1.5-pro",          # higher quality fallback
+        "gemini-pro",              # legacy but reliable last resort
     ]
 
     response = None
@@ -114,20 +113,21 @@ def generate_tech_fact() -> str:
         for attempt in range(1, max_retries + 1):
             try:
                 logger.info("Trying Gemini model: %s (attempt %d/%d)", model_name, attempt, max_retries)
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                )
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(prompt)
                 logger.info("Success with model: %s", model_name)
-                break  # inner loop
+                break  # inner retry loop
             except Exception as e:
                 last_error = e
                 err_str = str(e)
-                # 404 = model gone/deprecated → skip to next model immediately
-                if "404" in err_str or "NOT_FOUND" in err_str or "no longer available" in err_str.lower():
-                    logger.warning("Model '%s' is unavailable (deprecated/removed). Trying next model ...", model_name)
-                    break  # exit retry loop, try next model
-                # Other error (rate limit, overload) → retry with backoff
+                # 404 / NOT_FOUND = model deprecated → skip to next immediately
+                if any(x in err_str for x in ["404", "NOT_FOUND", "no longer available", "not found for API"]):
+                    logger.warning(
+                        "Model '%s' unavailable (deprecated/removed). Trying next model ...",
+                        model_name,
+                    )
+                    break  # skip retries, go to next model
+                # Other errors (rate limit, overload) → retry with backoff
                 if attempt < max_retries:
                     wait = attempt * 15
                     logger.warning(
@@ -136,9 +136,9 @@ def generate_tech_fact() -> str:
                     )
                     time.sleep(wait)
                 else:
-                    logger.warning("All retries exhausted for model '%s'. Trying next model ...", model_name)
+                    logger.warning("All retries exhausted for '%s'. Trying next model ...", model_name)
         if response is not None:
-            break  # outer loop – we have a response
+            break  # got a response, exit model loop
 
     if response is None:
         raise RuntimeError(
