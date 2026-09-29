@@ -144,6 +144,26 @@ async def _synthesise_speech(text: str, output_path: str) -> None:
     await communicate.save(output_path)
 
 
+def _run_async(coro):
+    """Safely run a coroutine whether or not an event loop already exists.
+
+    asyncio.run() raises RuntimeError when called inside an already-running
+    loop (e.g. Jupyter, some CI environments). This helper handles both cases.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # We're inside a running loop – schedule as a task
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(asyncio.run, coro)
+                return future.result()
+        else:
+            return loop.run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
+
+
 def generate_voiceover(text: str) -> str:
     """Generate an MP3 voiceover from *text* using Microsoft Edge TTS.
 
@@ -151,7 +171,9 @@ def generate_voiceover(text: str) -> str:
         Absolute path to the saved audio file.
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    asyncio.run(_synthesise_speech(text, AUDIO_PATH))
+    _run_async(_synthesise_speech(text, AUDIO_PATH))
+    if not os.path.exists(AUDIO_PATH) or os.path.getsize(AUDIO_PATH) < 100:
+        raise RuntimeError(f"Voiceover generation failed – file missing or empty: {AUDIO_PATH}")
     logger.info("Voiceover saved -> %s", AUDIO_PATH)
     return AUDIO_PATH
 
@@ -250,13 +272,20 @@ def _wrap_text(text: str, max_chars_per_line: int = 28) -> str:
 
 
 def _loop_clip_to_duration(clip: VideoFileClip, target_duration: float) -> VideoFileClip:
-    """Loop or trim *clip* so its duration matches *target_duration*."""
+    """Loop or trim *clip* so its duration matches *target_duration*.
+
+    BUG FIX: moviepy v2 does not support reusing the same clip instance
+    multiple times in concatenate_videoclips – each element must be an
+    independent object. We reload from the source file for each copy.
+    """
     if clip.duration >= target_duration:
         return clip.subclipped(0, target_duration)
 
-    # Need to loop – concatenate copies until we exceed target, then trim
+    # Need to loop – create fresh copies from the same source file
     loops_needed = int(target_duration // clip.duration) + 1
-    looped = concatenate_videoclips([clip] * loops_needed)
+    source_file = clip.filename
+    copies = [VideoFileClip(source_file) for _ in range(loops_needed)]
+    looped = concatenate_videoclips(copies)
     return looped.subclipped(0, target_duration)
 
 
@@ -304,40 +333,52 @@ def compose_video(fact_text: str) -> str:
 
     # ── Text overlay – shadow layer (offset for depth) ──
     wrapped = _wrap_text(fact_text)
+    bold_font = _find_bold_font()
 
+    # BUG FIX: Build shadow first, capture its height BEFORE using it in
+    # a lambda – referencing `shadow_clip.h` inside the lambda it's
+    # defined on causes an AttributeError in moviepy v2.
     shadow_clip = TextClip(
         text=wrapped,
         font_size=62,
         color="black",
-        font=_find_bold_font(),
+        font=bold_font,
         method="caption",
         size=(VIDEO_WIDTH - 120, None),
         text_align="center",
-    ).with_position(("center", "center")).with_duration(duration)
+    ).with_duration(duration)
 
-    # Offset shadow slightly down-right
-    shadow_clip = shadow_clip.with_position(
-        lambda t: ("center", VIDEO_HEIGHT // 2 - shadow_clip.h // 2 + 4)
-    )
+    # Capture height now (after clip is created) and use a static position
+    shadow_y = VIDEO_HEIGHT // 2 - shadow_clip.h // 2 + 4
+    shadow_clip = shadow_clip.with_position(("center", shadow_y))
 
     # -- Text overlay - main bright text --
     text_clip = TextClip(
         text=wrapped,
         font_size=62,
         color="white",
-        font=_find_bold_font(),
+        font=bold_font,
         method="caption",
         size=(VIDEO_WIDTH - 120, None),
         text_align="center",
     ).with_position(("center", "center")).with_duration(duration)
 
+    # BUG FIX: Clamp audio to the final video duration so subclipped
+    # never receives an end time beyond the audio's actual length.
+    audio_duration = min(audio.duration, duration)
+    synced_audio = audio.subclipped(0, audio_duration)
+
     # ── Composite everything ──
     final = CompositeVideoClip(
         [bg, overlay, shadow_clip, text_clip],
         size=(VIDEO_WIDTH, VIDEO_HEIGHT),
-    ).with_audio(audio.subclipped(0, min(audio.duration, duration)))
+    ).with_audio(synced_audio)
 
-    final.duration = duration
+    # BUG FIX: Do NOT set final.duration manually after with_audio();
+    # moviepy v2 computes duration from clips – overwriting it corrupts
+    # the timeline. Use with_end() instead if truncation is needed.
+    if final.duration > duration:
+        final = final.with_end(duration)
 
     # ── Render ──
     logger.info("Rendering final video ...")
@@ -350,6 +391,10 @@ def compose_video(fact_text: str) -> str:
         threads=4,
         logger=None,  # suppress moviepy's verbose bar in CI
     )
+
+    # Verify output was actually created
+    if not os.path.exists(FINAL_VIDEO_PATH) or os.path.getsize(FINAL_VIDEO_PATH) < 1000:
+        raise RuntimeError(f"Video render failed – output file missing or too small: {FINAL_VIDEO_PATH}")
 
     # Cleanup moviepy resources
     audio.close()

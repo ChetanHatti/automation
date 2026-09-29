@@ -9,6 +9,7 @@
 #   PEXELS_API_KEY          – Pexels API key
 #   YOUTUBE_OAUTH_TOKEN     – Contents of token.json (from local OAuth flow)
 #   YOUTUBE_CLIENT_SECRETS  – Contents of client_secrets.json
+#   GH_PAT                  – GitHub PAT with secrets:write scope (for token refresh)
 # ──────────────────────────────────────────────────────────────────────────
 
 name: Daily Kids Fun Fact Short
@@ -21,11 +22,9 @@ on:
   # Allow manual trigger from GitHub UI for testing
   workflow_dispatch:
 
-  # Push trigger keeps the repo "active" so GitHub doesn't disable
-  # the scheduled cron for inactivity (repos idle >60 days get disabled)
-  push:
-    branches:
-      - main
+# NOTE: push trigger removed intentionally.
+# It caused a pipeline run on every commit, wasting YouTube quota.
+# The 60-day inactivity concern is addressed by the daily schedule itself.
 
 # Needed to write back a refreshed token.json if OAuth token auto-refreshes
 permissions:
@@ -34,7 +33,7 @@ permissions:
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -62,47 +61,112 @@ jobs:
             fonts-liberation \
             imagemagick
 
-      # ── 4. Install Python dependencies ──
+      # ── 4. FIX: Remove ImageMagick security policy that blocks TextClip ──
+      #
+      # Ubuntu's default ImageMagick policy.xml blocks certain rendering
+      # operations needed by moviepy's TextClip (caption mode).
+      # Without this fix, compose_video() silently produces a video with
+      # NO text overlay, or crashes entirely.
+      - name: Fix ImageMagick security policy for moviepy TextClip
+        run: |
+          POLICY_FILE="/etc/ImageMagick-6/policy.xml"
+          if [ -f "$POLICY_FILE" ]; then
+            sudo sed -i 's/<policy domain="coder" rights="none"/<policy domain="coder" rights="read|write"/g' "$POLICY_FILE"
+            sudo sed -i 's/<policy domain="path" rights="none"/<policy domain="path" rights="read|write"/g' "$POLICY_FILE"
+            echo "ImageMagick policy updated successfully."
+            cat "$POLICY_FILE"
+          else
+            echo "No ImageMagick policy file found – skipping."
+          fi
+
+      # ── 5. Install Python dependencies ──
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      # ── 5. Restore YouTube OAuth credentials from secrets ──
+      # ── 6. Restore YouTube OAuth credentials from secrets ──
+      #
+      # BUG FIX: Use printf instead of echo to avoid a trailing newline
+      # being appended to the JSON files, which breaks JSON parsing.
       - name: Write YouTube credentials
         env:
           YOUTUBE_OAUTH_TOKEN: ${{ secrets.YOUTUBE_OAUTH_TOKEN }}
           YOUTUBE_CLIENT_SECRETS: ${{ secrets.YOUTUBE_CLIENT_SECRETS }}
         run: |
-          echo "$YOUTUBE_OAUTH_TOKEN" > token.json
-          echo "$YOUTUBE_CLIENT_SECRETS" > client_secrets.json
+          printf '%s' "$YOUTUBE_OAUTH_TOKEN" > token.json
+          printf '%s' "$YOUTUBE_CLIENT_SECRETS" > client_secrets.json
           echo "Credentials written successfully."
 
-      # ── 6. Validate secrets are present ──
+      # ── 7. Validate secrets are present ──
       - name: Validate required secrets
         run: |
           python - <<'EOF'
-          import os, sys
+          import os, sys, json
           missing = []
           for var in ["GEMINI_API_KEY", "PEXELS_API_KEY"]:
               if not os.environ.get(var):
                   missing.append(var)
-          if not os.path.exists("token.json") or os.path.getsize("token.json") < 10:
+
+          # Validate token.json is valid JSON
+          token_path = "token.json"
+          if not os.path.exists(token_path) or os.path.getsize(token_path) < 10:
               missing.append("YOUTUBE_OAUTH_TOKEN (token.json is empty)")
-          if not os.path.exists("client_secrets.json") or os.path.getsize("client_secrets.json") < 10:
+          else:
+              try:
+                  data = json.loads(open(token_path).read())
+                  if "token" not in data and "access_token" not in data:
+                      missing.append("YOUTUBE_OAUTH_TOKEN (missing access_token field)")
+              except json.JSONDecodeError as e:
+                  missing.append(f"YOUTUBE_OAUTH_TOKEN (invalid JSON: {e})")
+
+          # Validate client_secrets.json is valid JSON
+          secrets_path = "client_secrets.json"
+          if not os.path.exists(secrets_path) or os.path.getsize(secrets_path) < 10:
               missing.append("YOUTUBE_CLIENT_SECRETS (client_secrets.json is empty)")
+          else:
+              try:
+                  json.loads(open(secrets_path).read())
+              except json.JSONDecodeError as e:
+                  missing.append(f"YOUTUBE_CLIENT_SECRETS (invalid JSON: {e})")
+
           if missing:
-              print("ERROR: Missing secrets:", missing)
+              print("ERROR: Missing or invalid secrets:", missing)
               sys.exit(1)
-          print("All required secrets are present.")
+          print("All required secrets are present and valid.")
           EOF
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
 
-      # ── 7. Run the pipeline ──
+      # ── 8. Run the pipeline ──
       - name: Generate & upload video
         run: python main.py
 
-      # ── 8. Upload the rendered video as a build artifact (backup) ──
+      # ── 9. Persist refreshed OAuth token back to GitHub Secrets ──
+      #
+      # BUG FIX (CRITICAL): Google OAuth tokens expire and are automatically
+      # refreshed by google-auth. If the refreshed token is NOT saved back to
+      # the YOUTUBE_OAUTH_TOKEN secret, tomorrow's scheduled run will fail with
+      # "invalid_grant" / "Token has been expired or revoked".
+      #
+      # Prerequisites:
+      #   1. Create a GitHub Personal Access Token (PAT) at:
+      #      GitHub → Settings → Developer settings → Personal access tokens
+      #      Grant it the "secrets" write scope for this repository.
+      #   2. Add the PAT as a GitHub Secret named GH_PAT.
+      - name: Persist refreshed OAuth token to GitHub Secrets
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -n "$GH_TOKEN" ] && [ -f token.json ] && [ -s token.json ]; then
+            gh secret set YOUTUBE_OAUTH_TOKEN < token.json
+            echo "Refreshed token.json persisted back to YOUTUBE_OAUTH_TOKEN secret."
+          else
+            echo "Skipping token refresh: GH_PAT not set or token.json missing."
+            echo "WARNING: If the token was refreshed, tomorrow's run may fail!"
+          fi
+
+      # ── 10. Upload the rendered video as a build artifact (backup) ──
       - name: Archive rendered video
         if: always()
         uses: actions/upload-artifact@v4
